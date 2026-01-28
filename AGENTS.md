@@ -22,6 +22,8 @@
 - `utils/`: 常量、CosyVoice token <-> audio 相关工具
 - `examples/`: 测试音频
 - `third_party/`: 上游代码（不作为风格参考，尽量不改）
+- `actions/`: post-processing actions（如任务派发/邮件草稿生成等，轻依赖，便于复用）
+- `actions/mail_dispatcher/`: 根据会议 action items 按负责人邮箱生成邮件草稿（默认不发送）
 
 **Scope**：修改集中在 `audiochat/`、`scripts/`、`utils/`；`third_party/` 仅在必要时最小化修改。
 
