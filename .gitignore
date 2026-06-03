@@ -56,6 +56,9 @@ tensorboard/
 
 # Data
 datasets/
+data/
+*.tar.gz
+*.json
 
 # OS
 .DS_Store

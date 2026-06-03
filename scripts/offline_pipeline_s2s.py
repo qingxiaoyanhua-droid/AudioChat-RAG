@@ -74,7 +74,7 @@ def main() -> None:
 
     parser.add_argument(
         "--funaudiochat-model",
-        default="/data/models/Voice/FunAudioLLM/Fun-Audio-Chat-8B",
+        default="~/llm/voice/Fun-Audio-Chat/pretrained_models/Fun-Audio-Chat-8B",
     )
     parser.add_argument("--llm-device", default="cuda:0")
     parser.add_argument(

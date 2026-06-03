@@ -1,0 +1,1 @@
+给我写个脚本判断wer，GitHub 是predict， github是label，注意不区分大小写，

@@ -16,9 +16,17 @@ def dispatch_master_issue(
 
     action_items = parse_action_items(action_lines)
     grouped = group_by_owner(action_items)
+    
+    # 收集所有需要分配的 Gitea 用户
+    assignees = []
+    for owner in grouped.keys():
+        gitea_user = owner_to_gitea.get(owner)
+        if gitea_user:
+            assignees.append(gitea_user)
+    
     body = render_master_issue_body(meeting_title, meeting_date, grouped, owner_to_gitea=owner_to_gitea)
 
     title = f"[Action Items] {meeting_title}" + (f" {meeting_date}" if meeting_date else "")
-    res = create_issue(title=title, body=body)
+    res = create_issue(title=title, body=body, assignees=assignees)
 
     return res.url
