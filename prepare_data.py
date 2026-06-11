@@ -255,7 +255,9 @@ def generate_grpo_data(num_samples: int = 100) -> List[Dict]:
     {
         "prompt": "请总结以下会议记录：...",
         "reference": "标准答案/参考总结",
-        "query": "会议总结"
+        "query": "会议总结",
+        "source_context": "张三：后端API已完成80%...",  # 当前会议转写
+        "retrieved_docs": ["[历史会议] 张三上周提到...", ...],  # RAG 历史文档
     }
     """
     data = []
@@ -276,11 +278,26 @@ def generate_grpo_data(num_samples: int = 100) -> List[Dict]:
         # 生成总结（作为 reference）
         reference = generate_meeting_summary(transcript)
 
+        # 生成 source_context（当前会议转写）
+        source_context = transcript_text
+
+        # retrieved_docs 来自 RAG 历史文档池，每次随机抽取 1-3 条
+        rag_pool = generate_rag_data(num_meetings=20)
+        num_docs = random.randint(1, 3)
+        retrieved_docs = [
+            f"[历史会议 {m['meeting_id']}] " + " ".join(
+                r["content"] for r in m["records"][:3]
+            )
+            for m in random.sample(rag_pool, min(num_docs, len(rag_pool)))
+        ]
+
         # 构建样本
         sample = {
             "prompt": f"请总结以下会议记录：\n\n{transcript_text}",
             "reference": reference,
-            "query": "会议总结"
+            "query": "会议总结",
+            "source_context": source_context,
+            "retrieved_docs": retrieved_docs,
         }
 
         data.append(sample)
@@ -300,7 +317,9 @@ def generate_preference_data(num_samples: int = 100) -> List[Dict]:
     {
         "prompt": "请总结以下会议记录：...",
         "chosen": "优质总结",
-        "rejected": "劣质总结"
+        "rejected": "劣质总结",
+        "source_context": "张三：后端API已完成80%...",  # 当前会议转写
+        "retrieved_docs": ["[历史会议] 张三上周提到...", ...],  # RAG 历史文档
     }
     """
     data = []
@@ -328,10 +347,25 @@ def generate_preference_data(num_samples: int = 100) -> List[Dict]:
 具体内容详见会议记录。
 """
 
+        # 生成 source_context（当前会议转写）
+        source_context = transcript_text
+
+        # retrieved_docs 来自 RAG 历史文档池，每次随机抽取 1-3 条
+        rag_pool = generate_rag_data(num_meetings=20)
+        num_docs = random.randint(1, 3)
+        retrieved_docs = [
+            f"[历史会议 {m['meeting_id']}] " + " ".join(
+                r["content"] for r in m["records"][:3]
+            )
+            for m in random.sample(rag_pool, min(num_docs, len(rag_pool)))
+        ]
+
         sample = {
             "prompt": f"请总结以下会议记录：\n\n{transcript_text}",
             "chosen": chosen,
-            "rejected": rejected
+            "rejected": rejected,
+            "source_context": source_context,
+            "retrieved_docs": retrieved_docs,
         }
 
         data.append(sample)
@@ -490,6 +524,8 @@ def main():
         sample = grpo_data[0]
         print(f"Prompt: {sample['prompt'][:100]}...")
         print(f"Reference: {sample['reference'][:100]}...")
+        print(f"Source Context: {sample.get('source_context', 'N/A')[:100]}...")
+        print(f"Retrieved Docs: {len(sample.get('retrieved_docs', []))} 条")
 
     if args.task in ["preference", "all"]:
         print("\n[偏好数据样例]")

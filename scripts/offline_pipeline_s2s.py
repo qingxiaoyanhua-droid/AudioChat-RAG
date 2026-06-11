@@ -159,7 +159,7 @@ def main() -> None:
             indent=2,
         )
 
-    instruction = build_llm_instruction(
+    instruction, rag_contexts = build_llm_instruction(
         utterances=utterances,
         user_instruction=args.instruction,
         max_lines=args.max_lines,

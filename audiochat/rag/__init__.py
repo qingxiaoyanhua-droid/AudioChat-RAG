@@ -33,6 +33,7 @@ from audiochat.rag.hierarchical_retriever import (
     HierarchicalRetriever,
     HierarchicalRetrievedContext,
 )
+from audiochat.rag.faithfulness import FaithfulnessChecker, FaithfulnessResult, Claim
 
 __all__ = [
     # 原有
@@ -53,4 +54,8 @@ __all__ = [
     # 新增：分层检索器
     "HierarchicalRetriever",
     "HierarchicalRetrievedContext",
+    # 新增：RAGVUE 忠实度检查
+    "FaithfulnessChecker",
+    "FaithfulnessResult",
+    "Claim",
 ]

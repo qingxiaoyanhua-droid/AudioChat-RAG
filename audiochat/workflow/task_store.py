@@ -22,6 +22,197 @@ from typing import Iterator, Optional
 from audiochat.workflow.state import TaskState, TaskStatus
 
 
+# ---------------------------------------------------------------------------
+# SOP 沉淀触发器（被 approve_and_send 调用）
+# ---------------------------------------------------------------------------
+
+def _try_precipitate_sop(state: TaskState, store_dir: str) -> None:
+    """
+    会议 APPROVED 后，检查是否满足 SOP 沉淀条件。
+
+    沉淀条件：
+      1. 质量报告综合评分 >= 7.0
+      2. 同一会议类型出现 2+ 次（L1 索引）
+      3. 会议类型不是 standup / brainstorm
+
+    沉淀流程：
+      1. 调用 LLM 提取 SOP 结构（from summary）
+      2. 打印 HITL 确认提示
+      3. 用户确认（y/Y）则写入 L3
+    """
+    if state.quality_report is None:
+        print("[SOP沉淀] 无质量报告，跳过沉淀检查")
+        return
+    if state.quality_report.overall_score < 7.0:
+        print(f"[SOP沉淀] 质量评分 {state.quality_report.overall_score:.1f} < 7.0，跳过沉淀检查")
+        return
+
+    try:
+        from audiochat.rag.memory_hierarchy import HierarchicalMeetingStore, L3SOPEntry, classify_meeting_type
+        from audiochat.rag.memory_hierarchy import MeetingType
+    except ImportError:
+        print("[SOP沉淀] RAG 模块未安装，跳过沉淀检查")
+        return
+
+    hier_store = HierarchicalMeetingStore(persist_dir=store_dir + "_hierarchical")
+
+    # 从 summary 推断会议类型
+    meeting_type = classify_meeting_type(state.summary or "")
+
+    # 排除 standup / brainstorm
+    excluded = {MeetingType.STANDUP, MeetingType.BRAINSTORM}
+    if meeting_type in excluded:
+        print(f"[SOP沉淀] 会议类型 {meeting_type.value} 不适合沉淀，跳过")
+        return
+
+    # 统计同类会议出现次数
+    same_type_count = 0
+    primary_type = meeting_type.value
+    for other_id, l1_entry in hier_store.l1_entries.items():
+        if other_id == state.task_id:
+            continue
+        if any(t == primary_type for t in l1_entry.meeting_types):
+            same_type_count += 1
+
+    if same_type_count < 1:
+        print(f"[SOP沉淀] 同类会议（{primary_type}）首次出现，不满足 2+ 次条件，跳过")
+        return
+
+    # LLM 提取 SOP 结构
+    sop_type_map = {
+        MeetingType.INTERVIEW: "interview",
+        MeetingType.WEEKLY_REVIEW: "weekly_review",
+        MeetingType.REQUIREMENT_REVIEW: "requirement_review",
+        MeetingType.RETROSPECTIVE: "retrospective",
+        MeetingType.ONE_ON_ONE: "one_on_one",
+    }
+    sop_type = sop_type_map.get(meeting_type, meeting_type.value)
+
+    sop_structure = _extract_sop_with_llm(state.summary or "", sop_type)
+
+    # 打印 HITL 确认
+    print("\n" + "=" * 60)
+    print(f"【SOP 沉淀建议】会议类型: {sop_type}")
+    print(f"综合评分: {state.quality_report.overall_score:.1f}/10")
+    print(f"同类会议出现次数: {same_type_count + 1}")
+    print(f"\nSOP 结构预览:")
+    print(f"  类型: {sop_structure.get('sop_type', sop_type)}")
+    print(f"  关键步骤: {len(sop_structure.get('key_steps', []))} 步")
+    print(f"  前置条件: {len(sop_structure.get('preconditions', []))} 条")
+    print(f"  失败案例: {len(sop_structure.get('failure_cases', []))} 条")
+    print("=" * 60)
+    print("SOP沉淀建议: ")
+    print(sop_structure.get("content", ""))
+    print("=" * 60)
+    try:
+        confirm = input("是否写入 L3 SOP？（确认请输入 y/Y，否则跳过）: ").strip()
+    except (EOFError, OSError):
+        confirm = ""
+
+    if confirm.lower() not in ("y",):
+        print("[SOP沉淀] 用户取消，跳过写入 L3")
+        return
+
+    # 写入 L3
+    from datetime import datetime
+    sop_entry = L3SOPEntry(
+        sop_type=sop_structure.get("sop_type", sop_type),
+        content=sop_structure.get("content", ""),
+        key_steps=sop_structure.get("key_steps", []),
+        preconditions=sop_structure.get("preconditions", []),
+        failure_cases=sop_structure.get("failure_cases", []),
+        meeting_id=state.task_id,
+        meeting_types=[primary_type],
+        verified=False,
+        timestamp=datetime.now().isoformat(),
+    )
+    doc_id = hier_store.add_l3_sop(sop_entry)
+    print(f"[SOP沉淀] 已写入 L3，doc_id={doc_id}")
+
+
+# ---------------------------------------------------------------------------
+# SOP 提取 Prompt（用于 LLM 调用）
+# ---------------------------------------------------------------------------
+
+SOP_EXTRACTION_PROMPT = """你是一个会议 SOP 提炼专家。请根据以下会议总结，提取标准操作流程（SOP）。
+
+## 会议总结
+{summary}
+
+## 任务
+请以 JSON 格式输出 SOP 结构，包含以下字段：
+{{
+    "sop_type": "sop类型（如 interview, weekly_review, requirement_review）",
+    "content": "SOP 核心描述（自由文本，100-300字）",
+    "key_steps": ["步骤1", "步骤2", "..."],
+    "preconditions": ["前置条件1", "前置条件2", "..."],
+    "failure_cases": ["常见失败案例1", "常见失败案例2", "..."]
+}}
+
+## 要求
+- key_steps 列出 3-8 个关键步骤
+- preconditions 列出 2-5 个前置条件
+- failure_cases 列出 2-5 个常见失败案例
+- 内容必须基于提供的会议总结，不得凭空编造
+- 输出仅包含 JSON，不要有其他文字
+"""
+
+
+def _extract_sop_with_llm(summary: str, sop_type: str) -> dict:
+    """调用 LLM 从会议总结中提取 SOP 结构"""
+    try:
+        from audiochat.llm.funaudiochat_llm import FunAudioChatLLM
+        import os
+    except ImportError as exc:
+        print(f"[SOP沉淀] LLM 模块导入失败: {exc}，使用默认结构")
+        return _default_sop_structure(sop_type)
+
+    model_path = os.environ.get(
+        "FUNAUDIOCHAT_MODEL",
+        "/data/models/Voice/FunAudioLLM/Fun-Audio-Chat-8B",
+    )
+
+    try:
+        llm = FunAudioChatLLM(model_path=model_path, device="cuda:0")
+        prompt = SOP_EXTRACTION_PROMPT.format(summary=summary)
+        result = llm.generate_text(instruction=prompt)
+        text = result.text.strip()
+
+        # 尝试从输出中提取 JSON
+        import json as _json
+        for line in text.split("\n"):
+            line = line.strip()
+            if line.startswith("{") or line.startswith("```json"):
+                if line.startswith("```"):
+                    line = line[7:].strip()
+                try:
+                    return _json.loads(line if line.startswith("{") else text)
+                except _json.JSONDecodeError:
+                    pass
+
+        # 尝试解析整个文本
+        try:
+            return _json.loads(text)
+        except _json.JSONDecodeError:
+            print(f"[SOP沉淀] LLM 输出无法解析为 JSON，使用默认结构")
+            return _default_sop_structure(sop_type)
+
+    except Exception as exc:
+        print(f"[SOP沉淀] LLM 调用失败: {exc}，使用默认结构")
+        return _default_sop_structure(sop_type)
+
+
+def _default_sop_structure(sop_type: str) -> dict:
+    """SOP 提取失败时的默认结构"""
+    return {
+        "sop_type": sop_type,
+        "content": f"从会议总结中提取的 {sop_type} 标准操作流程（详细内容见会议总结）",
+        "key_steps": ["准备会议材料", "进行会议讨论", "确认行动项", "整理会议记录"],
+        "preconditions": ["会议召集人已确认参会人员", "议程已提前分发"],
+        "failure_cases": ["会议超时未形成结论", "行动项未指定负责人"],
+    }
+
+
 class TaskStore:
     """
     线程安全的 JSON 文件存储。
@@ -146,6 +337,9 @@ class TaskStore:
             actor=Actor(who=approver, role="user"),
         )
         self.save(state)
+
+        # SOP 沉淀检查（APPROVED 触发）
+        _try_precipitate_sop(state, self.store_dir)
 
         result = sender_fn(state)
         if result.sent:

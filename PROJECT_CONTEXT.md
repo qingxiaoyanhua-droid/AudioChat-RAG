@@ -415,6 +415,7 @@ bash run_mini_eval.sh 2>&1 | tee logs/mini_eval.log
 - [x] **Phase 1：Metadata Filter**（meeting_id_filter + time_range 复合过滤，ChromaDB where 优化）
 - [x] **Phase 2：意图识别路由**（规则兜底 + 小模型精判，3 类意图分流）
 - [x] **Phase 3：Agentic RAG**（信息缺口分析 + 并发批量检索 + 上下文压缩）
+- [x] **Phase 4：RAGVUE 忠实度检查**（原子断言分解 + 逐条验证 + 关键实体/时间严格匹配，EACL 2026）
 - [x] SFT 训练（response-only loss masking）
 - [x] GRPO 训练（PPO-clip + 自适应 KL + 9维奖励 + 软 gate 机制）
 - [x] 评估模块（ROUGE-L + BERTScore + Faithfulness）

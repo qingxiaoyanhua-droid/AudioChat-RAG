@@ -197,6 +197,7 @@ def stage_llm(
 
     # Agentic RAG 模式：信息缺口分析 + 批量检索 + 上下文压缩
     planning_result = None
+    rag_contexts = []
     if getattr(args, "agentic_rag", False) and args.mode == "summary" and retriever is not None:
         print(f"[Agentic RAG] 启用信息缺口分析 + 批量检索...")
         instruction, planning_result = build_agentic_instruction(
@@ -211,7 +212,7 @@ def stage_llm(
         else:
             print(f"[Agentic RAG] 无需补充历史信息")
     else:
-        instruction = build_llm_instruction(
+        instruction, rag_contexts = build_llm_instruction(
             utterances=utterances,
             user_instruction=user_instr,
             max_lines=args.max_lines,
@@ -233,8 +234,8 @@ def stage_llm(
     state.action_items = tuple(action_items)
 
     # Stage 5: AI 自动质量报告
-    print("[Workflow] Stage 5/5: AI 质量评估...")
-    report = _generate_and_save_report(state, llm)
+    print("[Workflow] Stage 5/5: AI 质量评估（含 RAGVUE 忠实度检查）...")
+    report = _generate_and_save_report(state, llm, utterances=utterances, retrieved_contexts=rag_contexts)
     state.quality_report = report
     state.status = TaskStatus.PENDING_APPROVAL
     store.save(state)
@@ -247,7 +248,7 @@ def stage_llm(
     print(f"[Workflow] 任务 {state.task_id} 进入待审核状态。")
     print(f"  查看任务列表：python scripts/task_cli.py list")
 
-    return {"text": result.text, "planning_result": planning_result}
+    return {"text": result.text, "planning_result": planning_result, "rag_contexts": rag_contexts}
 
 
 def _extract_action_items(text: str) -> list[str]:
@@ -268,11 +269,16 @@ def _extract_action_items(text: str) -> list[str]:
     return items
 
 
-def _generate_and_save_report(state, llm) -> "QualityReport":
+def _generate_and_save_report(state, llm, utterances: list, retrieved_contexts: list = None) -> "QualityReport":
     """调用质量报告生成器，带异常兜底"""
     from audiochat.workflow.quality_reporter import generate_quality_report
     try:
-        report = generate_quality_report(state, llm)
+        report = generate_quality_report(
+            state, llm,
+            utterances=utterances,
+            retrieved_contexts=retrieved_contexts,
+            enable_faithfulness=True,
+        )
         print(f"  [质量报告] 综合评分: {report.overall_score}/10  "
               f"建议: {'✅ PASS' if report.overall_pass else '⚠️ NEED_REVIEW'}")
         return report

@@ -711,6 +711,34 @@ class HierarchicalMeetingStore:
         """获取所有 L1 索引条目"""
         return list(self.l1_entries.values())
 
+    def route_l2_by_l1(self, meeting_id: str, query: str = "", k: int = 5) -> list[L2FactEntry]:
+        """
+        L1 → L2 路由：根据会议 L1 索引的关键词和说话人，
+        按需检索该会议相关的 L2 事实。
+
+        这是 L1 向 L2 的主动触发路径：
+          L1 提供关键词路由指针 → L2 按关键词过滤 facts
+
+        对应 GA 的"按需加载"原则：LLM 从 L1 看到关键词后，
+        主动请求加载匹配的 L2 facts。
+        """
+        entry = self.l1_entries.get(meeting_id)
+        if not entry:
+            return []
+
+        keywords = list(entry.keywords.keys())[:10]
+        if not keywords:
+            return []
+
+        # 用 L1 关键词作为 filter，过滤 L2 facts
+        facts = self.search_l2(
+            query=query or " ".join(keywords),
+            keywords_filter=keywords,
+            verified_only=True,
+            k=k,
+        )
+        return facts
+
     def render_l1_for_context(self, meeting_id: Optional[str] = None) -> str:
         """
         渲染 L1 为始终注入的上下文（对应 GA 的 always-on memory）
@@ -740,6 +768,96 @@ class HierarchicalMeetingStore:
                 f"(L2:{entry.l2_pointer_count} L3:{entry.l3_pointer_count} L4:{entry.l4_pointer_count})"
             )
         return "\n".join(lines)
+
+    def route_l2_by_l1(self, meeting_id: str, query: str = "") -> list[L2FactEntry]:
+        """
+        L1→L2 路由：根据 L1 索引的 keywords + speakers 检索匹配的 L2 事实。
+
+        路由逻辑：
+          1. 获取 L1 entry（meeting_id）
+          2. 提取 keywords 作为 L2 检索的关键词过滤器
+          3. 读取 L1 的 speakers 补充上下文
+          4. 调用 search_l2()，用 keywords_filter 过滤
+          5. 返回匹配的 L2 fact entries
+
+        与 render_l1_for_context 的区别：
+          - render_l1_for_context 只渲染 L1 为文本（无检索能力）
+          - route_l2_by_l1 执行 L1→L2 路由检索，返回结构化事实
+        """
+        l1_entry = self.get_l1_entry(meeting_id)
+        if not l1_entry:
+            return []
+
+        keywords = list(l1_entry.keywords.keys())
+        if not keywords:
+            return []
+
+        # 用 L1 keywords 作为过滤器检索 L2
+        facts = self.search_l2(
+            query=query or " ".join(keywords),
+            k=5,
+            keywords_filter=keywords,
+            verified_only=False,
+        )
+        return facts
+
+    def query_by_entity(
+        self,
+        entity_type: str,
+        entity_id: str,
+        query: str = "",
+        k: int = 5,
+    ) -> list[str]:
+        """
+        按实体查询事实（entity-centric 查询入口）。
+
+        entity_type:
+          - "person": 从 L2PersonProfile.meeting_ids 出发，收集相关会议的事实
+          - "requirement": 从 L3RequirementEvolution.meeting_ids 出发，收集相关会议的事实
+
+        返回匹配的 L2 事实内容列表（字符串）。
+        """
+        if entity_type == "person":
+            profile = self.get_l2_profile(entity_id)
+            if not profile:
+                return []
+            meeting_ids = set(profile.meeting_ids)
+        elif entity_type == "requirement":
+            evo = self.get_l3_requirement_evolution(entity_id)
+            if not evo:
+                return []
+            meeting_ids = set(evo.meeting_ids)
+        else:
+            return []
+
+        if not meeting_ids:
+            return []
+
+        # 从 L2 facts 中过滤出关联 meeting_id 的事实
+        try:
+            results = self.l2_collection.get(include=["documents", "metadatas"])
+        except Exception:
+            return []
+
+        matched = []
+        if results and results.get("documents"):
+            for i, doc in enumerate(results["documents"]):
+                meta = results["metadatas"][i] if results["metadatas"] else {}
+                if meta.get("meeting_id") in meeting_ids:
+                    if query:
+                        emb = self.embedder.encode(query, convert_to_numpy=True).tolist()
+                        doc_emb = results["embeddings"][i] if results.get("embeddings") else None
+                        if doc_emb:
+                            import numpy as np
+                            sim = float(np.dot(emb, doc_emb) / (np.linalg.norm(emb) * np.linalg.norm(doc_emb) + 1e-8))
+                            if sim > 0.5:
+                                matched.append(doc)
+                        else:
+                            matched.append(doc)
+                    else:
+                        matched.append(doc)
+
+        return matched[:k]
 
     # =========================================================================
     # L2 事实层
@@ -1165,7 +1283,53 @@ class HierarchicalMeetingStore:
     # 统计 & 清理
     # =========================================================================
 
-    def get_stats(self) -> dict:
+    def query_by_entity(
+        self,
+        entity_type: str,
+        entity_id: str,
+        query: str = "",
+        k: int = 5,
+    ) -> list[str]:
+        """
+        按实体查询事实（entity-centric 查询入口）。
+
+        L1 索引的是会议元数据（类型、关键词、说话人），
+        L2/L3 索引的是事实内容（facts、SOP、person profiles）。
+
+        entity_type == "person":
+            从 L2PersonProfile.meeting_ids 出发，
+            收集该人物参与过的所有会议中匹配的 facts。
+        entity_type == "requirement":
+            从 L3RequirementEvolution.meeting_ids 出发，
+            收集该需求关联的所有会议中匹配的 facts。
+        entity_type == "meeting":
+            直接返回指定 meeting_id 的 L2 facts。
+
+        Returns:
+            fact 内容列表
+        """
+        facts: list[str] = []
+        meeting_ids: list[str] = []
+
+        if entity_type == "person":
+            profile = self._l2_profiles.get(entity_id)
+            if profile:
+                meeting_ids = profile.meeting_ids
+        elif entity_type == "requirement":
+            evo = self._l3_requirement_evolutions.get(entity_id)
+            if evo:
+                meeting_ids = evo.meeting_ids
+        elif entity_type == "meeting":
+            meeting_ids = [entity_id]
+
+        # 按 meeting_id 定点加载 facts
+        for mid in meeting_ids:
+            l2_facts = self.search_l2(query=query, k=k)
+            for f in l2_facts:
+                if f.meeting_id == mid:
+                    facts.append(f.content)
+
+        return facts
         """获取分层存储统计信息"""
         return {
             "l1_entries": len(self.l1_entries),

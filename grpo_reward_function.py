@@ -23,8 +23,8 @@ GRPO 多维度奖励函数 - 完整可运行版
 
 维度合并说明（面试可答）：
   - structure 合并了 length（字数约束是格式的自然组成部分，不单独设维度）
-  - relevance 采用 HyDE-inspired 策略：用 retrieved_docs 作为 query 的语义代理，
-    解决 query 向量稀疏导致余弦相似度无意义的问题
+  - relevance（切题）：用 source_context（当前会议转写）比对，衡量是否答非所问
+  - faithfulness（防幻觉）：用 retrieved_docs（RAG 检索文档）比对，衡量是否一本正经胡说八道
 
 Soft Gate 机制：
   下游维度（忠实度/DAG/executability）乘以 √(structure_score)，
@@ -33,7 +33,7 @@ Soft Gate 机制：
 
 使用示例：
     reward_fn = GRPORewardFunction()
-    reward = reward_fn.compute_reward(generated, reference, query, retrieved_docs, action_items)
+    reward = reward_fn.compute_reward(generated, reference, query, retrieved_docs, source_context, action_items)
 """
 
 import torch
@@ -57,7 +57,8 @@ class GRPORewardFunction:
         - generated: 模型生成的会议纪要
         - reference: 标准答案（人工写的会议纪要）
         - query: 用户的问题（如"总结这次会议"）
-        - retrieved_docs: RAG 检索到的相关文档
+        - retrieved_docs: RAG 检索到的相关文档（用于 faithfulness 检查）
+        - source_context: 当前会议转写（用于 relevance 检查）
     
     输出：
         - reward: 0-1 之间的分数，越高越好
@@ -99,22 +100,27 @@ class GRPORewardFunction:
                        reference: str,
                        query: str,
                        retrieved_docs: List[str],
+                       source_context: str = None,
                        action_items: List[dict] = None) -> float:
         """
         计算八维度奖励（主函数）
 
         公式（面试重点）：
             reward = 0.20*准确性 + 0.15*忠实度 + 0.16*流畅度
-                   + 0.10*相关性(HyDE) + 0.18*结构化(合并length)
+                   + 0.10*相关性(切题) + 0.18*结构化(合并length)
                    + 0.08*executability + 0.07*dependency
                    + 0.06*coherence
 
-        relevance 的 HyDE-inspired 策略（面试要点）：
-            直接用短 query 编码做余弦相似度没有意义（query 稀疏）。
-            改用 retrieved_docs 的加权组合作为 query 的语义代理：
-            每个 doc 对 query 的相关性通过 max-sim 隐式得到，
-            而后再和 generated 算相似度。
-            本质上是用 RAG 检索到的文档语义来"扩写"了 query 的信息量。
+        relevance（相关性/切题）：
+            衡量生成内容是否围绕当前会议主题。
+            直接用当前会议转写（source_context）和 generated 算余弦相似度，
+            因为 source_context 是长文本（会议完整讨论），向量密度高。
+            解决 query 向量稀疏导致余弦相似度无意义的问题。
+
+        faithfulness（忠实度/防幻觉）：
+            衡量生成内容是否在 RAG 检索的历史文档知识范围内。
+            注意：这里不检查是否忠实于当前会议（那是 relevance 的职责），
+            只检查是否有凭空编造超出 RAG 知识范围的内容。
 
         Soft Gate 机制：
             下游维度（忠实度 / DAG / executability）的 reward 乘以 √(structure_score)，
@@ -128,7 +134,7 @@ class GRPORewardFunction:
         """
         accuracy_reward = self._accuracy_reward(generated, reference)
         fluency_reward = self._fluency_reward(generated)
-        relevance_reward = self._relevance_reward(generated, query, retrieved_docs)
+        relevance_reward = self._relevance_reward(generated, source_context)
         structure_score = self._structure_reward(generated, action_items)
         coherence_reward = self._coherence_reward(generated)
 
@@ -155,11 +161,15 @@ class GRPORewardFunction:
     
     def _faithfulness_reward(self, generated: str, retrieved_docs: List[str]) -> float:
         """
-        忠实度奖励（防幻觉）
-        
-        思路：生成内容中的每个关键句应能在源文档中找到依据。
-        具体做法——NLI 风格：将生成内容拆成句子，逐句与检索文档
-        计算最大语义相似度，低于阈值的视为"不忠实"。
+        防幻觉奖励（忠实度检查）
+
+        衡量生成内容是否在 RAG 检索的历史文档知识范围内。
+        注意：这里不检查是否忠实于当前会议（那是 relevance 的职责），
+        只检查是否有凭空编造超出 RAG 知识范围的内容。
+
+        与 relevance 的区别：
+          - relevance：回答有没有围绕当前会议 → 和 source_context 比
+          - faithfulness：有没有凭空编造内容 → 和 retrieved_docs 比
 
         面试要点：
           - 和准确性的区别：准确性比对 reference，忠实度比对 source docs
@@ -271,50 +281,47 @@ class GRPORewardFunction:
         
         return fluency
     
-    def _relevance_reward(self, generated: str, query: str, retrieved_docs: List[str] = None) -> float:
+    def _relevance_reward(self, generated: str, source_context: str) -> float:
         """
-        相关性奖励（HyDE-inspired 策略，解决 query 向量稀疏问题）
+        切题/相关性奖励（防跑题）
 
-        问题：query 通常很短（如"总结这次会议"），BGE 编码后向量高度稀疏，
-        直接和长文本 generated 算余弦相似度没有统计意义。
+        衡量生成内容是否围绕当前会议主题。
+        先从 source_context 中提取说话人/主题等元信息作为结构化前缀，
+        再 encode 整个文本，以提升 BGE 对专有名词的编码质量。
 
-        解决方案（HyDE-inspired）：
-            不直接用 query 向量，而是用 retrieved_docs 的拼接向量作为语义代理。
-            原理：retrieved_docs 是针对 query 从知识库中检索回来的文档，
-            它们天然是"和 query 相关的长文本"——
-            本质上就是 HyDE 思想中 LLM 生成的假设答案（Hypothetical Document）的角色。
-            我们把 docs 拼接后的向量当作 query 的语义扩展，
-            再和 generated 算余弦相似度，数值有实际物理含义。
-
-        面试要点：
-            - HyDE 原文是用 LLM 生成假设答案再做检索
-            - 我们这里是"借用 RAG pipeline 天然已有的检索结果"作为代理，
-              不需要额外调用 LLM，开销更小
-            - 另一个等价的解释：relevance = sim(docs_emb, generated_emb)，
-              衡量生成内容是否在检索文档张开的语义空间内
+        与 faithfulness 的区别：
+          - relevance：回答有没有围绕当前会议 → 和 source_context 比
+          - faithfulness：有没有凭空编造内容 → 和 retrieved_docs 比
         """
+        if not source_context:
+            return 0.5
 
-        # 如果没有检索文档，降级为 query 直接比对
-        if not retrieved_docs:
-            gen_emb = self.embedder.encode(generated, convert_to_numpy=True)
-            query_emb = self.embedder.encode(query, convert_to_numpy=True)
-            sim = cosine_similarity([gen_emb], [query_emb])[0][0]
-            return max(0.0, (sim + 1) / 2)
+        # 从转写中提取说话人，构建语义锚点前缀
+        # ASR 输出格式：说话人1: ... 说话人2: ...
+        import re as _re
+        # 匹配 "说话人X：" 或 "说话人X：" 后的名字/标签
+        speaker_sections = _re.findall(
+            r'([^\n：：]{1,10})[：:]', source_context[:500]
+        )
+        # 去重，保留顺序
+        seen = set()
+        speakers = []
+        for s in speaker_sections:
+            s = s.strip()
+            if s and s not in seen and len(s) <= 10:
+                seen.add(s)
+                speakers.append(s)
 
-        # HyDE-inspired：用 retrieved_docs 的拼接向量作为 query 的语义代理
-        # retrieved_docs 已经是针对 query 检索回来的文档，
-        # 天然具有"假设答案"的语义结构——和 generated 同为长文本
-        docs_text = " ".join(retrieved_docs)
-        docs_emb = self.embedder.encode(docs_text, convert_to_numpy=True)
+        meta_prefix = ""
+        if speakers:
+            meta_prefix = f"[参会人：{', '.join(speakers)}] "
+
+        text_to_embed = meta_prefix + source_context
+
         gen_emb = self.embedder.encode(generated, convert_to_numpy=True)
-
-        # 计算 generated 和 docs 语义空间的相似度
-        sim = cosine_similarity([gen_emb], [docs_emb])[0][0]
-
-        # 归一化到 0-1
-        relevance = max(0.0, (sim + 1) / 2)
-
-        return relevance
+        src_emb = self.embedder.encode(text_to_embed, convert_to_numpy=True)
+        sim = cosine_similarity([gen_emb], [src_emb])[0][0]
+        return max(0.0, (sim + 1) / 2)
     
     def _structure_reward(self, generated: str, action_items: list = None) -> float:
         """
@@ -688,20 +695,22 @@ class GRPORewardFunction:
         coherence = max(0.0, (avg_sim - 0.3) / 0.5)
         return min(1.0, coherence)
 
-    def compute_all_rewards(self, 
-                           generated_texts: List[str], 
+    def compute_all_rewards(self,
+                           generated_texts: List[str],
                            reference: str,
                            query: str,
+                           source_context: str,
                            retrieved_docs: List[str]) -> List[float]:
         """
         批量计算多个生成文本的奖励（用于 GRPO 训练）
-        
+
         参数：
             generated_texts: 多个生成的文本（通常 4 个）
             reference: 标准答案
             query: 用户问题
-            retrieved_docs: RAG 检索到的文档
-        
+            source_context: 当前会议转写（用于 relevance 计算）
+            retrieved_docs: RAG 检索到的文档（用于 faithfulness 计算）
+
         返回：
             rewards: 每个文本的奖励分数列表
         """
@@ -711,7 +720,8 @@ class GRPORewardFunction:
                 generated=generated,
                 reference=reference,
                 query=query,
-                retrieved_docs=retrieved_docs
+                retrieved_docs=retrieved_docs,
+                source_context=source_context,
             )
             rewards.append(reward)
         return rewards
@@ -762,6 +772,13 @@ if __name__ == "__main__":
 
     query = "总结这次会议"
 
+    transcript_text = """
+    今天我们开个会讨论项目进度。张三汇报说后端API已经完成了80%，预计本周五全部完成。
+    李四说前端页面完成了60%，正在等待后端API对接完成。
+    王五汇报测试用例已经写了50个，目标覆盖率是85%。
+    会上决定张三负责完成后端API，李四负责准备前端对接文档，王五负责继续编写测试用例。
+    """
+
     retrieved_docs = [
         "张三：后端 API 已完成 80%，预计本周五完成",
         "李四：前端页面完成 60%，等待后端对接",
@@ -774,6 +791,7 @@ if __name__ == "__main__":
         reference=reference,
         query=query,
         retrieved_docs=retrieved_docs,
+        source_context=transcript_text,
         action_items=[
             {"owner": "张三", "task": "完成后端 API 联调", "deadline": "本周五", "depends_on": []},
             {"owner": "李四", "task": "准备前端对接文档", "deadline": "下周", "depends_on": [0]},
@@ -786,7 +804,7 @@ if __name__ == "__main__":
     accuracy = reward_fn._accuracy_reward(generated, reference)
     faithfulness = reward_fn._faithfulness_reward(generated, retrieved_docs)
     fluency = reward_fn._fluency_reward(generated)
-    relevance = reward_fn._relevance_reward(generated, query, retrieved_docs)
+    relevance = reward_fn._relevance_reward(generated, transcript_text)
     structure = reward_fn._structure_reward(generated, [
         {"owner": "张三", "task": "完成后端 API 联调", "deadline": "本周五", "depends_on": []},
         {"owner": "李四", "task": "准备前端对接文档", "deadline": "下周", "depends_on": [0]},
@@ -816,7 +834,7 @@ if __name__ == "__main__":
     print("  准确性：  {:.3f} (权重 20%)".format(accuracy))
     print("  忠实度：  {:.3f} (权重 15%，gate 后)".format(faithfulness))
     print("  流畅度：  {:.3f} (权重 16%)".format(fluency))
-    print("  相关性：  {:.3f} (权重 10%，HyDE策略 — 用docs代理query)".format(relevance))
+    print("  相关性：  {:.3f} (权重 10%，切题 — 用source_context比对)".format(relevance))
     print("  结构化：  {:.3f} (权重 18%，含owner合规+字数)".format(structure))
     print("  executability: {:.3f} (权重 8%，gate后)".format(exec_))
     print("  dependency:    {:.3f} (权重 7%，gate后)".format(dep))
@@ -886,6 +904,7 @@ if __name__ == "__main__":
         reference=reference,
         query=query,
         retrieved_docs=retrieved_docs,
+        source_context=transcript_text,
         action_items=[]
     )
     good_reward = reward

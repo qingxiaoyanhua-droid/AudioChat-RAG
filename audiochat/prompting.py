@@ -547,7 +547,7 @@ def build_llm_instruction(
     mode: str = "summary",
     meeting_id: Optional[str] = None,
     time_range: Optional[tuple[str, str]] = None,
-) -> str:
+) -> tuple[str, list]:
     """
     构建发送给 LLM 的完整指令。
 
@@ -558,7 +558,7 @@ def build_llm_instruction(
       - time_range: 时间范围 tuple(start_iso, end_iso)，用于"历史会议"意图
 
     Returns:
-        完整的 LLM 指令字符串
+        tuple[str, list]: (完整的LLM指令字符串, RAG检索结果列表，无RAG时为空列表)
     """
     diar_text = format_utterances(utterances, max_lines=max_lines)
 
@@ -569,6 +569,7 @@ def build_llm_instruction(
 
     # RAG 检索（如果启用）
     rag_used = False
+    contexts = []
     if enable_rag and retriever is not None:
         if mode == "qa":
             # ===== QA 模式：意图识别 + 路由检索 =====
@@ -615,7 +616,7 @@ def build_llm_instruction(
             f"用户要求：{user_instruction}"
         )
 
-    return base_prompt
+    return (base_prompt, contexts)
 
 
 # 默认的总结 prompt（结构化会议纪要模板）

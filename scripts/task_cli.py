@@ -84,48 +84,125 @@ def _build_sender_fn(args) -> callable:
 
 
 # ---------------------------------------------------------------------------
-# 命令实现
+# SOP 沉淀逻辑（approve 成功后触发）
 # ---------------------------------------------------------------------------
 
-def cmd_list(args) -> None:
-    store = _load_store(args)
+def _try_precipitate_sop(state: TaskState) -> None:
+    """
+    检查是否需要沉淀 SOP。
 
-    if args.status:
-        try:
-            status = TaskStatus(args.status)
-        except ValueError:
-            print(f"未知状态：{args.status}，可选值：{[s.value for s in TaskStatus]}")
-            return
-        tasks = store.list_by_status(status)
-    else:
-        tasks = store.list_recent(limit=args.limit)
+    触发条件（来自 GA 的 No Execution, No Memory 原则）：
+      1. 同一类会议出现 2+ 次（L1 计数）
+      2. 总结质量达到阈值（overall_score >= 7.0）
+      3. 会议类型不是 standup / brainstorm（一次性讨论不沉淀 SOP）
 
-    if not tasks:
-        print("没有找到任务")
+    沉淀流程：
+      LLM 从总结中抽取 SOP 结构 → 打印 HITL 确认 → 用户确认后写入 L3
+    """
+    if not state.summary:
         return
 
-    print(f"\n{'任务ID':<14} {'状态':<10} {'综合评分':<10} {'行动项':<6} {'会议标题':<28} {'更新时间'}")
-    print("-" * 90)
-    for t in tasks:
-        status_short = {
-            TaskStatus.PENDING_APPROVAL: "PENDING",
-            TaskStatus.APPROVED: "APPROVED",
-            TaskStatus.EMAIL_SENT: "SENT",
-            TaskStatus.EMAIL_FAILED: "FAILED",
-            TaskStatus.REJECTED: "REJECTED",
-        }.get(t.status, t.status.value)
+    report = state.quality_report
+    if report is None or report.overall_score < 7.0:
+        return
 
-        if t.quality_report:
-            score = f"{t.quality_report.overall_score:.1f}"
-            pass_flag = "✅" if t.quality_report.overall_pass else "⚠️"
-        else:
-            score = "-"
-            pass_flag = ""
+    from audiochat.rag.memory_hierarchy import classify_meeting_type, HierarchicalMeetingStore, MeetingType
+    meeting_type = classify_meeting_type(state.summary)
+    if meeting_type in (MeetingType.STANDUP, MeetingType.BRAINSTORM, MeetingType.UNKNOWN):
+        return
 
-        action_count = len(t.action_items) if t.action_items else 0
+    hier_store = HierarchicalMeetingStore(persist_dir="./rag_storage_hierarchical")
+    same_type_entries = [
+        e for e in hier_store.get_all_l1_entries()
+        if any(mt in e.meeting_types for mt in meeting_type.value.split())
+    ]
+    if len(same_type_entries) < 2:
+        print(f"\n[SOP 沉淀] 同类型会议（{meeting_type.value}）目前仅 {len(same_type_entries)} 次，"
+              f"不足 2 次，暂不沉淀")
+        return
 
-        print(f"{t.task_id:<14} {status_short:<10} {score:<3}{pass_flag} "
-              f"{action_count:<6} {t.meeting_title[:26]:<28} {t.updated_at[:16]}")
+    print(f"\n[SOP 沉淀] 检测到同类会议 ≥2 次，质量达标，正在抽取 SOP...")
+    sop_entry = _extract_sop_from_summary(state, meeting_type)
+    if sop_entry is None:
+        return
+
+    print(f"\n{'='*60}")
+    print(f"[SOP 沉淀建议] 是否将以下 SOP 写入 L3？")
+    print(f"  类型: {sop_entry.sop_type}")
+    print(f"  标题: {sop_entry.content[:80]}...")
+    print(f"  步骤: {' | '.join(sop_entry.key_steps[:5])}")
+    if sop_entry.failure_cases:
+        print(f"  常见失败: {sop_entry.failure_cases[0]}")
+    print(f"{'='*60}")
+    confirm = input("  确认写入 L3？(y/N): ").strip().lower()
+    if confirm == "y":
+        hier_store.add_l3_sop(sop_entry)
+        print(f"  ✅ SOP 已写入 L3（{sop_entry.sop_type}）")
+    else:
+        print(f"  ⏭️  跳过")
+
+
+def _extract_sop_from_summary(state: TaskState, meeting_type) -> "L3SOPEntry | None":
+    """
+    用 LLM 从会议总结中抽取 SOP 结构。
+
+    Returns:
+        L3SOPEntry 或 None（抽取失败时）
+    """
+    from audiochat.rag.memory_hierarchy import L3SOPEntry, MeetingType
+
+    sop_type_map = {
+        MeetingType.WEEKLY_REVIEW: "weekly_review",
+        MeetingType.REQUIREMENT_REVIEW: "requirement_review",
+        MeetingType.INTERVIEW: "interview",
+        MeetingType.RETROSPECTIVE: "retrospective",
+        MeetingType.ONE_ON_ONE: "one_on_one",
+    }
+    sop_type = sop_type_map.get(meeting_type, "general")
+
+    prompt = f"""从以下会议总结中抽取可复用的 SOP（标准操作流程）。
+
+会议总结：
+{state.summary[:2000]}
+
+请按以下 JSON 格式输出（只输出 JSON，不要有其他内容）：
+{{
+  "content": "SOP 的简要描述（一句话）",
+  "preconditions": ["前置条件1", "前置条件2"],
+  "key_steps": ["步骤1", "步骤2", "步骤3"],
+  "failure_cases": ["常见失败案例1", "常见失败案例2"]
+}}
+"""
+
+    try:
+        from audiochat.llm.funaudiochat_llm import FunAudioChatLLM
+        llm = FunAudioChatLLM(
+            model_path="~/llm/voice/Fun-Audio-Chat/pretrained_models/Fun-Audio-Chat-8B",
+            device="cuda:0",
+        )
+        result = llm.generate_text(instruction=prompt)
+        text = result.text.strip()
+
+        import re as _re
+        m = _re.search(r"\{.*\}", text, _re.DOTALL)
+        if not m:
+            return None
+        data = json.loads(m.group())
+
+        from datetime import datetime
+        return L3SOPEntry(
+            sop_type=sop_type,
+            content=data.get("content", ""),
+            preconditions=data.get("preconditions", []),
+            key_steps=data.get("key_steps", []),
+            failure_cases=data.get("failure_cases", []),
+            meeting_types=[meeting_type.value],
+            verified=False,
+            meeting_id=state.task_id,
+            timestamp=datetime.now().isoformat(),
+        )
+    except Exception:
+        return None
 
 
 def cmd_show(args) -> None:
@@ -215,6 +292,9 @@ def cmd_approve(args) -> None:
         print(f"✅ 任务 {args.task_id} 已确认，邮件发送完成")
         print(f"   发送至 : {', '.join(result.get('sent_to', []))}")
         print(f"   Issue  : {', '.join(result.get('issue_urls', []))}")
+
+    # SOP 沉淀检查（在 approve 成功后自动触发）
+    _try_precipitate_sop(state)
 
 
 def cmd_reject(args) -> None:

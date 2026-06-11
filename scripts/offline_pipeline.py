@@ -263,7 +263,7 @@ def main() -> None:
         from audiochat.prompting import DEFAULT_SUMMARY_INSTRUCTION
         user_instr = DEFAULT_SUMMARY_INSTRUCTION
 
-    instruction = build_llm_instruction(
+    instruction, rag_contexts = build_llm_instruction(
         utterances=utterances,
         user_instruction=user_instr,
         max_lines=args.max_lines,

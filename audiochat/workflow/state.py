@@ -89,6 +89,14 @@ class QualityReport:
     generated_at: str = field(default_factory=lambda: datetime.now().isoformat())
     raw_output: str = ""               # AI 原始输出（便于调试/人工复核）
 
+    # RAGVUE 忠实度字段（v2 新增）
+    faithfulness_score: float = 0.0     # 忠实度得分 0.0~1.0
+    faithfulness_total_claims: int = 0   # 原子断言总数
+    faithfulness_supported: int = 0       # supported 断言数
+    faithfulness_hallucinated: int = 0   # hallucinated 断言数（partially + fully）
+    faithfulness_critical: tuple[str, ...] = field(default_factory=tuple)  # 严重问题
+    faithfulness_raw: str = ""           # 忠实度检查原始输出
+
     def to_dict(self) -> dict:
         return {
             "summary_score": self.summary_score,
@@ -99,6 +107,13 @@ class QualityReport:
             "overall_score": self.overall_score,
             "generated_at": self.generated_at,
             "raw_output": self.raw_output,
+            # RAGVUE 忠实度
+            "faithfulness_score": self.faithfulness_score,
+            "faithfulness_total_claims": self.faithfulness_total_claims,
+            "faithfulness_supported": self.faithfulness_supported,
+            "faithfulness_hallucinated": self.faithfulness_hallucinated,
+            "faithfulness_critical": list(self.faithfulness_critical),
+            "faithfulness_raw": self.faithfulness_raw,
         }
 
     @classmethod
@@ -112,6 +127,12 @@ class QualityReport:
             overall_score=d.get("overall_score", 0.0),
             generated_at=d.get("generated_at", datetime.now().isoformat()),
             raw_output=d.get("raw_output", ""),
+            faithfulness_score=d.get("faithfulness_score", 0.0),
+            faithfulness_total_claims=d.get("faithfulness_total_claims", 0),
+            faithfulness_supported=d.get("faithfulness_supported", 0),
+            faithfulness_hallucinated=d.get("faithfulness_hallucinated", 0),
+            faithfulness_critical=tuple(d.get("faithfulness_critical", [])),
+            faithfulness_raw=d.get("faithfulness_raw", ""),
         )
 
     def display_summary(self) -> str:
@@ -120,6 +141,13 @@ class QualityReport:
         lines.append(f"  总结质量   : {self.summary_score:.1f}/10")
         lines.append(f"  行动项质量 : {self.action_item_score:.1f}/10")
         lines.append(f"  综合评分   : {self.overall_score:.1f}/10")
+        if self.faithfulness_total_claims > 0:
+            pct = self.faithfulness_score * 100
+            lines.append(f"  忠实度     : {pct:.0f}% ({self.faithfulness_supported}/{self.faithfulness_total_claims} 断言 supported)")
+        if self.faithfulness_critical:
+            lines.append(f"  严重问题   :")
+            for issue in self.faithfulness_critical:
+                lines.append(f"    - {issue}")
         if self.issues:
             lines.append(f"  发现问题   :")
             for issue in self.issues:
